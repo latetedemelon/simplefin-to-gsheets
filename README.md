@@ -46,7 +46,7 @@ Contributions to the SimpleFIN to Google Sheets Sync project are welcome! If you
 
 ## Donations
 
-If you find VISCAL helpful and would like to support its development, consider making a donation to the project. Every little bit helps!
+If you find SimpleFIN to Google Sheets Sync helpful and would like to support its development, consider making a donation to the project. Every little bit helps!
 
 <a href='https://paypal.me/latetedemelon' target='_blank'><img src="https://github.com/stefan-niedermann/paypal-donate-button/blob/master/paypal-donate-button.png" width="270" height="105" alt='Donate via Paypay' />
 
