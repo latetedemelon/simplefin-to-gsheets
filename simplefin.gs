@@ -83,28 +83,53 @@ function storeAccessCodeUrl(token) {
     return;
   }
   
-  const decodedToken = Utilities.base64Decode(token);
-  const claimUrl = Utilities.newBlob(decodedToken).getDataAsString();
+  let decodedToken;
+  let claimUrl;
+  try {
+    decodedToken = Utilities.base64Decode(token);
+    claimUrl = Utilities.newBlob(decodedToken).getDataAsString();
+  } catch (error) {
+    Logger.log('Error decoding token: ' + error.message);
+    SpreadsheetApp.getUi().alert('Error', 'Invalid token format. Please ensure you have a valid base64-encoded SimpleFin token.', SpreadsheetApp.getUi().ButtonSet.OK);
+    return;
+  }
   
   const accessCodeUrl = getAccessCodeUrl(claimUrl);
   
-  const scriptProperties = PropertiesService.getScriptProperties();
-  scriptProperties.setProperty('accessCodeUrl', accessCodeUrl);
+  if (accessCodeUrl) {
+    const scriptProperties = PropertiesService.getScriptProperties();
+    scriptProperties.setProperty('accessCodeUrl', accessCodeUrl);
+  }
 }
 
 /**
  * Retrieves the access code URL from a claim URL by making a POST request.
  * @param {string} claimUrl - The claim URL to post to.
- * @returns {string} The access code URL.
+ * @returns {string|null} The access code URL, or null on error.
  */
 function getAccessCodeUrl(claimUrl) {
   const options = {
-    method: 'POST'
+    method: 'POST',
+    muteHttpExceptions: true
   };
-  const response = UrlFetchApp.fetch(claimUrl, options);
-  const accessCodeUrl = response.getContentText();
-
-  return accessCodeUrl;
+  
+  try {
+    const response = UrlFetchApp.fetch(claimUrl, options);
+    const responseCode = response.getResponseCode();
+    
+    if (responseCode !== 200) {
+      Logger.log('Claim URL Error: HTTP ' + responseCode + ' - ' + response.getContentText());
+      SpreadsheetApp.getUi().alert('Error', 'Failed to claim access code. HTTP Status: ' + responseCode, SpreadsheetApp.getUi().ButtonSet.OK);
+      return null;
+    }
+    
+    const accessCodeUrl = response.getContentText();
+    return accessCodeUrl;
+  } catch (error) {
+    Logger.log('Error getting access code URL: ' + error.message);
+    SpreadsheetApp.getUi().alert('Error', 'An error occurred while claiming access code: ' + error.message, SpreadsheetApp.getUi().ButtonSet.OK);
+    return null;
+  }
 }
 
 /**
@@ -188,7 +213,7 @@ function getAccountsAndTransactionsNoDate(accessCodeUrl) {
  * @returns {Array} An array containing [baseUrl, credentials].
  */
 function splitUrlAndCredentials(accessCodeUrl) {
-  const schemaRest= accessCodeUrl.split('//', 2);
+  const schemaRest = accessCodeUrl.split('//', 2);
   const fullRest = schemaRest[1].split('@', 2);
   const auth = fullRest[0];
   const schema = schemaRest[0];
@@ -303,6 +328,7 @@ function updateTransactionsSheet(accounts) {
 /**
  * Updates the Balances sheet with the current account balances.
  * Creates a new row for today's date if it doesn't exist.
+ * Uses batch operations for improved performance.
  * @param {Array} accountsData - Array of account objects from the API.
  */
 function updateBalancesSheet(accountsData) {
@@ -312,32 +338,62 @@ function updateBalancesSheet(accountsData) {
   const today = new Date();
   const formattedToday = today.toLocaleDateString();
   
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  
+  // Read all existing data in one batch operation
+  let existingData = [];
+  let headerRow = [];
+  if (lastRow > 0 && lastCol > 0) {
+    existingData = sheet.getRange(1, 1, lastRow, lastCol).getValues();
+    headerRow = existingData[0] || [];
+  }
+  
   // Find row with today's date in the first column
   let rowIndex = -1;
-  for (let i = 1; i <= sheet.getLastRow(); i++) {
-    const rowDate = sheet.getRange(i, 1).getValue();
+  for (let i = 0; i < existingData.length; i++) {
+    const rowDate = existingData[i][0];
     if (rowDate instanceof Date && rowDate.toLocaleDateString() === formattedToday) {
-      rowIndex = i;
+      rowIndex = i + 1; // Convert to 1-based index
       break;
     }
   }
   
   // If today's date not found, create a new row
   if (rowIndex === -1) {
-    rowIndex = sheet.getLastRow() + 1;
-    sheet.getRange(rowIndex, 1).setValue(formattedToday);
+    rowIndex = lastRow + 1;
   }
 
-  // Update account balances
+  // Build header updates and balance updates
+  const headerUpdates = [];
+  const balanceUpdates = [];
+  
   accountsData.forEach((account, index) => {
-    const colIndex = index + 2;
-
-    // Add account ID to header row if not already present
-    if (sheet.getLastRow() === 0 || sheet.getRange(1, colIndex).getValue() !== account.id) {
-      sheet.getRange(1, colIndex).setValue(account.id);
+    const colIndex = index + 2; // Column index (1-based, starting from column 2)
+    
+    // Check if account ID header needs update
+    const currentHeader = headerRow[colIndex - 1]; // 0-based array access
+    if (currentHeader !== account.id) {
+      headerUpdates.push({ col: colIndex, value: account.id });
     }
-
-    sheet.getRange(rowIndex, colIndex).setValue(account.balance);
+    
+    balanceUpdates.push({ col: colIndex, value: account.balance });
   });
+  
+  // Write date for new row if needed
+  if (rowIndex > lastRow) {
+    sheet.getRange(rowIndex, 1).setValue(formattedToday);
+  }
+  
+  // Batch write header updates
+  headerUpdates.forEach((update) => {
+    sheet.getRange(1, update.col).setValue(update.value);
+  });
+  
+  // Batch write all balance values in a single row operation
+  if (balanceUpdates.length > 0) {
+    const balanceValues = balanceUpdates.map((u) => u.value);
+    sheet.getRange(rowIndex, 2, 1, balanceValues.length).setValues([balanceValues]);
+  }
 }
 
