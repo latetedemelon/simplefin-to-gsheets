@@ -22,7 +22,7 @@ This project allows users to sync financial data from SimpleFIN API into Google 
   - **Balances** — a dated time series of each account's balance.
   - **Holdings** — investment/brokerage positions: symbol, shares, cost basis, market value, purchase price, currency, and description.
   - **Errors** — any errors the API reports (e.g. an account that failed to sync), so partial failures are visible instead of silent.
-- Pulls all available transaction history by default (configurable via `LOOKBACK_DAYS`) and includes pending transactions (`pending=1`).
+- Pulls all available transaction history by paging backward in 90-day windows — the SimpleFIN bridge caps a single request to ~90 days — and includes pending transactions (`pending=1`). Tunable via `LOOKBACK_DAYS` / `MAX_HISTORY_DAYS`.
 - Automate updates to financial data based on scheduled syncs.
 - Manage financial data directly in Google Sheets.
 
@@ -47,7 +47,8 @@ This project allows users to sync financial data from SimpleFIN API into Google 
 
 - This script is specific to the SimpleFIN API and Google Sheets. It does not support other APIs or spreadsheet applications.
 - The script may have performance limitations when dealing with large datasets. Pulling full history on the first sync can be slow for accounts with a long transaction history; set `LOOKBACK_DAYS` to a positive number for a rolling window instead.
-- The tool requests API v2 but falls back gracefully if a server still returns the v1 format. Fields such as `Holdings` only appear for institutions/accounts that provide them.
+- The tool requests API v2 but falls back gracefully if a server still returns the v1 format. Fields such as `Holdings` only appear for institutions/accounts that provide them. To force v1, set `SIMPLEFIN_API_VERSION = 1` (or `null`).
+- If an account is missing (e.g. a mortgage), the connection almost certainly needs re-authorization at the SimpleFIN Bridge — look for a `con.auth` entry in the **Errors** / **Debug** sheet, then re-link that connection at bridge.simplefin.org. This is a bank-link state and is not affected by the API version.
 
 ## Contributing
 

@@ -6,9 +6,11 @@ const ERRORS_SHEET_NAME = 'Errors';
 const DEBUG_SHEET_NAME = 'Debug';
 
 // SimpleFIN API request configuration.
-const SIMPLEFIN_API_VERSION = 2;   // Protocol version to request; set to null to omit (server default / v1 wire format).
+const SIMPLEFIN_API_VERSION = 2;   // Protocol version to request; set to 1 (or null) for the v1 wire format.
 const INCLUDE_PENDING = true;      // When true, adds pending=1 so pending transactions are returned.
-const LOOKBACK_DAYS = 0;           // 0 => all available history (start-date=0); >0 => rolling window of that many days.
+const LOOKBACK_DAYS = 0;           // 0 => page back through all available history; >0 => only the last N days.
+const WINDOW_DAYS = 90;            // SimpleFIN bridge caps a single /accounts request to ~90 days; don't exceed.
+const MAX_HISTORY_DAYS = 730;      // How far back to page when LOOKBACK_DAYS = 0 (safety cap; ~2 years).
 
 /**
  * Creates a custom menu in Google Sheets when the spreadsheet is opened.
@@ -361,29 +363,100 @@ function resolveOrgFields(account, connMap) {
 }
 
 /**
+ * Fetches transaction history from the SimpleFin API, paging backward in <= WINDOW_DAYS
+ * windows because the bridge caps a single /accounts request to ~90 days. The first window
+ * uses start-date=0 so pending transactions (which may have posted=0) are included.
+ * Transactions from every window are merged per account (de-duplicated by transaction id).
+ * @param {string} accessCodeUrl
+ * @returns {{firstResponse: Object, mergedAccounts: Array}|null}
+ */
+function fetchTransactionHistory(accessCodeUrl) {
+  const now = Math.floor(new Date().getTime() / 1000);
+  const totalDays = LOOKBACK_DAYS > 0 ? LOOKBACK_DAYS : MAX_HISTORY_DAYS;
+  const stopWhenEmpty = (LOOKBACK_DAYS === 0);
+  const windowSecs = WINDOW_DAYS * 86400;
+  const earliest = now - totalDays * 86400;
+
+  const accountMeta = {};
+  const txByAccount = {};
+  const seen = {};
+
+  function accumulate(resp) {
+    let addedAny = false;
+    (resp.accounts || []).forEach((account) => {
+      if (!accountMeta[account.id]) {
+        accountMeta[account.id] = account;
+        txByAccount[account.id] = [];
+        seen[account.id] = {};
+      }
+      (account.transactions || []).forEach((transaction) => {
+        if (!seen[account.id][transaction.id]) {
+          seen[account.id][transaction.id] = true;
+          txByAccount[account.id].push(transaction);
+          addedAny = true;
+        }
+      });
+    });
+    return addedAny;
+  }
+
+  // Recent window: start-date=0 also returns pending transactions (posted may be 0). The
+  // bridge caps this to ~90 days, which is an expected/benign message (see surfaceApiErrors).
+  const firstResponse = getAccountsAndTransactions(accessCodeUrl, 0, now);
+  if (!firstResponse || !Array.isArray(firstResponse.accounts)) {
+    return null;
+  }
+  accumulate(firstResponse);
+
+  // Page further back in <= WINDOW_DAYS windows for older history.
+  let consecutiveEmpty = 0;
+  let windowEnd = now - windowSecs;
+  while (windowEnd > earliest) {
+    const windowStart = Math.max(earliest, windowEnd - windowSecs);
+    const resp = getAccountsAndTransactions(accessCodeUrl, windowStart, windowEnd);
+    if (!resp || !Array.isArray(resp.accounts)) {
+      break;
+    }
+    const addedAny = accumulate(resp);
+    consecutiveEmpty = addedAny ? 0 : consecutiveEmpty + 1;
+    if (windowStart <= earliest || (stopWhenEmpty && consecutiveEmpty >= 2)) {
+      break;
+    }
+    windowEnd = windowStart;
+  }
+
+  const mergedAccounts = Object.keys(accountMeta).map((id) => {
+    const merged = {};
+    const source = accountMeta[id];
+    for (const key in source) {
+      merged[key] = source[key];
+    }
+    merged.transactions = txByAccount[id];
+    return merged;
+  });
+  Logger.log('Fetched history for ' + mergedAccounts.length + ' account(s).');
+  return { firstResponse: firstResponse, mergedAccounts: mergedAccounts };
+}
+
+/**
  * Updates all accounts and transactions by fetching from the SimpleFin API.
- * Pulls all available history by default (LOOKBACK_DAYS = 0).
+ * Pages back through all available history by default (LOOKBACK_DAYS = 0).
  */
 function updateAccountsAndTransactions() {
   const scriptProperties = PropertiesService.getScriptProperties();
   const accessCodeUrl = scriptProperties.getProperty('accessCodeUrl');
-  Logger.log('Access Code URL from properties: ' + accessCodeUrl);
 
-  const endDate = Math.floor(new Date().getTime() / 1000);
-  // LOOKBACK_DAYS = 0 => start-date=0 (epoch) => all available history, incl. pending (posted=0).
-  const startDate = LOOKBACK_DAYS > 0 ? endDate - LOOKBACK_DAYS * 86400 : 0;
-
-  const responseData = getAccountsAndTransactions(accessCodeUrl, startDate, endDate);
-  if (responseData && Array.isArray(responseData.accounts)) {
-    const connMap = buildConnectionMap(responseData);
-    updateAccountsSheet(responseData.accounts, connMap);
-    updateTransactionsSheet(responseData.accounts);
-    updateBalancesSheet(responseData.accounts);
-    updateHoldingsSheet(responseData.accounts);
-    surfaceApiErrors(responseData);
-  } else {
-    Logger.log('Error: responseData.accounts is not an array');
+  const history = fetchTransactionHistory(accessCodeUrl);
+  if (!history) {
+    Logger.log('Error: no account data returned');
+    return;
   }
+  const connMap = buildConnectionMap(history.firstResponse);
+  updateAccountsSheet(history.firstResponse.accounts, connMap); // current balances/metadata
+  updateTransactionsSheet(history.mergedAccounts);              // full paged history
+  updateBalancesSheet(history.firstResponse.accounts);
+  updateHoldingsSheet(history.firstResponse.accounts);
+  surfaceApiErrors(history.firstResponse);
 }
 
 /**
@@ -660,6 +733,17 @@ function updateHoldingsSheet(accounts) {
 }
 
 /**
+ * True for the expected "date range exceeds 90 days and was capped" notice, which the bridge
+ * returns because we intentionally request start-date=0 to capture pending transactions. It is
+ * recorded as an informational message rather than counted as an error.
+ * @param {string} msg
+ * @returns {boolean}
+ */
+function isBenignCapMessage(msg) {
+  return typeof msg === 'string' && /90 days|was capped/i.test(msg);
+}
+
+/**
  * Surfaces API errors into the Errors sheet so partial failures are visible instead of silent.
  * Handles v2 structured errlist, v1 plain-string errors, and per-account failure flags.
  * The sheet is cleared and fully rewritten each run.
@@ -682,18 +766,24 @@ function surfaceApiErrors(responseData) {
   // v2 structured errors.
   if (Array.isArray(responseData.errlist)) {
     responseData.errlist.forEach((err) => {
-      rows.push([now, 'errlist', err.code || '', err.msg || '', err.conn_id || '', err.account_id || '']);
-      Logger.log('SimpleFin error: ' + (err.code || '') + ' ' + (err.msg || ''));
-      errorCount++;
+      const benign = isBenignCapMessage(err.msg);
+      rows.push([now, benign ? 'message' : 'errlist', err.code || '', err.msg || '', err.conn_id || '', err.account_id || '']);
+      Logger.log('SimpleFin ' + (benign ? 'message' : 'error') + ': ' + (err.code || '') + ' ' + (err.msg || ''));
+      if (!benign) {
+        errorCount++;
+      }
     });
   }
 
   // v1 plain-string errors.
   if (Array.isArray(responseData.errors)) {
     responseData.errors.forEach((msg) => {
-      rows.push([now, 'errors', '', msg, '', '']);
-      Logger.log('SimpleFin error: ' + msg);
-      errorCount++;
+      const benign = isBenignCapMessage(msg);
+      rows.push([now, benign ? 'message' : 'errors', '', msg, '', '']);
+      Logger.log('SimpleFin ' + (benign ? 'message' : 'error') + ': ' + msg);
+      if (!benign) {
+        errorCount++;
+      }
     });
   }
 
