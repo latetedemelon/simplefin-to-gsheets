@@ -3,6 +3,7 @@ const TRANSACTIONS_SHEET_NAME = 'Transactions';
 const BALANCES_SHEET_NAME = 'Balances';
 const HOLDINGS_SHEET_NAME = 'Holdings';
 const ERRORS_SHEET_NAME = 'Errors';
+const DEBUG_SHEET_NAME = 'Debug';
 
 // SimpleFIN API request configuration.
 const SIMPLEFIN_API_VERSION = 2;   // Protocol version to request; set to null to omit (server default / v1 wire format).
@@ -20,6 +21,7 @@ function onOpen() {
     .addItem('Update Accounts and Transactions', 'updateAccountsAndTransactions')
     .addItem('Update Balances', 'updateBalances')
     .addItem('Update Holdings', 'updateHoldings')
+    .addItem('Debug: List Returned Accounts', 'debugListAccounts')
     .addToUi();
 }
 
@@ -337,7 +339,7 @@ function resolveOrgFields(account, connMap) {
     // v2 wire format: org data lives on the Connection object.
     return {
       domain: '',
-      name: account.conn_name || conn.name || '',
+      name: conn.org_name || conn.name || '',
       orgId: conn.org_id || '',
       orgUrl: conn.org_url || '',
       sfinUrl: conn.sfin_url || '',
@@ -453,7 +455,7 @@ function updateAccountsSheet(accounts, connMap) {
 }
 
 /**
- * Extends a legacy 8-column Transactions header to the current 10-column layout without
+ * Extends a legacy Transactions header to the current column layout without
  * disturbing existing data rows (new columns are simply appended to the header row).
  * @param {Sheet} sheet - The Transactions sheet.
  * @param {Array} header - The current, full header row.
@@ -471,17 +473,95 @@ function migrateTransactionsHeaderIfNeeded(sheet, header) {
 }
 
 /**
- * Updates the Transactions sheet with new transactions.
- * Uses Set for O(1) duplicate checking and batch operations for improved performance.
- * New columns (Transacted At, Category) are appended after the original columns so the
- * dedup read on Transaction ID (column 3) and existing rows stay aligned.
+ * Returns true if the value is a Date object (e.g. a date cell read from a sheet).
+ * @param {*} x
+ * @returns {boolean}
+ */
+function isDateValue(x) {
+  return Object.prototype.toString.call(x) === '[object Date]';
+}
+
+/**
+ * Builds a Transactions sheet row for a transaction. Column order must match the header
+ * in updateTransactionsSheet().
+ * @param {Object} account
+ * @param {Object} transaction
+ * @returns {Array}
+ */
+function buildTransactionRow(account, transaction) {
+  const extra = transaction.extra || {};
+  // MCC (ISO 18245 merchant category code) is a top-level transaction field; fall back to extra.
+  const mcc = transaction.mcc || extra.mcc || extra.category || '';
+  // Posted is 0 for not-yet-posted (pending) transactions; show blank rather than 1970.
+  const postedDate = transaction.posted ? new Date(transaction.posted * 1000) : '';
+  return [
+    account.id, account.name, transaction.id, postedDate,
+    transaction.amount, transaction.description, transaction.pending,
+    JSON.stringify(extra), toDateOrBlank(transaction.transacted_at),
+    mcc, transaction.payee || '', transaction.memo || ''
+  ];
+}
+
+/**
+ * Composite de-duplication key for a transaction. SimpleFIN transaction IDs are unique only
+ * WITHIN an account (the demo returns the same id in two accounts), so the account ID must be
+ * part of the key to avoid dropping a real transaction as a false duplicate.
+ * @param {string} accountId
+ * @param {string} transactionId
+ * @returns {string}
+ */
+function transactionKey(accountId, transactionId) {
+  var a = String(accountId);
+  return a.length + ':' + a + ':' + String(transactionId);
+}
+
+/**
+ * Signature of a transaction's mutable fields (pending, posted, amount, description),
+ * used to detect changes such as pending -> posted or amount adjustments. Computed
+ * identically from an API transaction and from an existing sheet row so the two can be
+ * compared. Deliberately excludes the supplementary columns (transacted_at, category,
+ * extra) so that adding those columns does not flag every historical row as "changed".
+ * @param {Object} transaction - An API transaction object.
+ * @returns {string}
+ */
+function transactionApiSignature(transaction) {
+  const pending = transaction.pending === true;
+  const posted = transaction.posted ? transaction.posted : '';
+  const amount = transaction.amount == null ? '' : Number(transaction.amount);
+  const description = transaction.description == null ? '' : String(transaction.description);
+  return JSON.stringify([pending, posted, amount, description]);
+}
+
+/**
+ * Signature of an existing Transactions sheet row, comparable to transactionApiSignature().
+ * @param {Array} row - A row read from the Transactions sheet.
+ * @returns {string}
+ */
+function transactionRowSignature(row) {
+  const pending = row[6] === true;
+  const posted = isDateValue(row[3]) ? Math.floor(row[3].getTime() / 1000) : '';
+  const amount = (row[4] === '' || row[4] == null) ? '' : Number(row[4]);
+  const description = row[5] == null ? '' : String(row[5]);
+  return JSON.stringify([pending, posted, amount, description]);
+}
+
+/**
+ * Updates the Transactions sheet incrementally:
+ *   - Appends transactions whose ID is not yet present.
+ *   - Updates an existing row in place when the transaction changed (e.g. pending -> posted,
+ *     amount adjustment), detected via a signature of its mutable fields.
+ *   - Leaves unchanged and out-of-window rows untouched, so the full history is preserved.
+ * De-duplicates by account ID + transaction ID (SimpleFIN IDs are unique only within an
+ * account). New columns (Transacted At, MCC, Payee, Memo) are appended after the original
+ * columns so legacy rows stay aligned.
  * @param {Array} accounts - Array of account objects from the API.
  */
 function updateTransactionsSheet(accounts) {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(TRANSACTIONS_SHEET_NAME);
 
   const header = ['Account ID', 'Account Name', 'Transaction ID', 'Posted',
-                  'Amount', 'Description', 'Pending', 'Extra', 'Transacted At', 'Category'];
+                  'Amount', 'Description', 'Pending', 'Extra', 'Transacted At',
+                  'MCC', 'Payee', 'Memo'];
 
   // Write the header if the sheet is empty; otherwise migrate a legacy header in place.
   if (sheet.getLastRow() === 0) {
@@ -490,37 +570,53 @@ function updateTransactionsSheet(accounts) {
     migrateTransactionsHeaderIfNeeded(sheet, header);
   }
 
-  // Get the range of transaction IDs in the sheet and use Set for O(1) lookups.
+  const numCols = header.length;
   const lastRow = sheet.getLastRow();
-  let existingTransactionIds = new Set();
+
+  // Index existing rows by (account ID + transaction ID) -> { rowNumber, signature }.
+  const existingByKey = {};
   if (lastRow > 1) {
-    const transactionIdRange = sheet.getRange(2, 3, lastRow - 1, 1);
-    existingTransactionIds = new Set(transactionIdRange.getValues().flat());
+    const existing = sheet.getRange(2, 1, lastRow - 1, numCols).getValues();
+    for (let i = 0; i < existing.length; i++) {
+      const row = existing[i];
+      const id = row[2];
+      if (id !== '' && id != null) {
+        existingByKey[transactionKey(row[0], id)] = { rowNumber: i + 2, sig: transactionRowSignature(row) };
+      }
+    }
   }
 
-  // Collect all new transactions in a batch array
   const newTransactions = [];
+  const updates = [];
+  const seenNewKeys = new Set();
 
   accounts.forEach((account) => {
     (account.transactions || []).forEach((transaction) => {
-      // Check if the transaction ID already exists using Set for O(1) lookup.
-      if (!existingTransactionIds.has(transaction.id)) {
-        const extra = transaction.extra || {};
-        const category = extra.category || extra.mcc || '';
-        // Posted is 0 for not-yet-posted (pending) transactions; show blank rather than 1970.
-        const postedDate = transaction.posted ? new Date(transaction.posted * 1000) : '';
-        newTransactions.push([
-          account.id, account.name, transaction.id, postedDate,
-          transaction.amount, transaction.description, transaction.pending,
-          JSON.stringify(extra), toDateOrBlank(transaction.transacted_at), category
-        ]);
-        // Add to set to prevent duplicates within the same batch
-        existingTransactionIds.add(transaction.id);
+      const key = transactionKey(account.id, transaction.id);
+      const existing = existingByKey[key];
+      if (!existing) {
+        // Brand-new transaction: queue for append (guard against dupes within this batch).
+        if (!seenNewKeys.has(key)) {
+          newTransactions.push(buildTransactionRow(account, transaction));
+          seenNewKeys.add(key);
+        }
+        return;
+      }
+      // Existing transaction: update the row only if its mutable fields changed.
+      const newSig = transactionApiSignature(transaction);
+      if (newSig !== existing.sig) {
+        updates.push({ rowNumber: existing.rowNumber, values: buildTransactionRow(account, transaction) });
+        existing.sig = newSig; // prevent re-updating the same row within this batch
       }
     });
   });
 
-  // Write all new transactions in a single batch operation
+  // Apply in-place updates to changed rows (e.g. pending -> posted).
+  updates.forEach((update) => {
+    sheet.getRange(update.rowNumber, 1, 1, update.values.length).setValues([update.values]);
+  });
+
+  // Append brand-new transactions in a single batch operation.
   if (newTransactions.length > 0) {
     const startRow = sheet.getLastRow() + 1;
     sheet.getRange(startRow, 1, newTransactions.length, newTransactions[0].length).setValues(newTransactions);
@@ -581,12 +677,14 @@ function surfaceApiErrors(responseData) {
   const rows = [
     ['Timestamp', 'Type', 'Code', 'Message', 'Conn ID', 'Account ID']
   ];
+  let errorCount = 0;
 
   // v2 structured errors.
   if (Array.isArray(responseData.errlist)) {
     responseData.errlist.forEach((err) => {
       rows.push([now, 'errlist', err.code || '', err.msg || '', err.conn_id || '', err.account_id || '']);
       Logger.log('SimpleFin error: ' + (err.code || '') + ' ' + (err.msg || ''));
+      errorCount++;
     });
   }
 
@@ -595,6 +693,7 @@ function surfaceApiErrors(responseData) {
     responseData.errors.forEach((msg) => {
       rows.push([now, 'errors', '', msg, '', '']);
       Logger.log('SimpleFin error: ' + msg);
+      errorCount++;
     });
   }
 
@@ -602,16 +701,24 @@ function surfaceApiErrors(responseData) {
   (responseData.accounts || []).forEach((account) => {
     if (account.failed) {
       rows.push([now, 'account.failed', '', String(account.failed), account.conn_id || '', account.id || '']);
+      errorCount++;
     }
     if (account.missingdata) {
       rows.push([now, 'account.missingdata', '', String(account.missingdata), account.conn_id || '', account.id || '']);
+      errorCount++;
     }
+  });
+
+  // Informational messages from the API (e.g. hints about start-date); not errors.
+  [].concat(responseData['x-api-message'] || []).forEach((msg) => {
+    rows.push([now, 'message', '', String(msg), '', '']);
+    Logger.log('SimpleFin message: ' + msg);
   });
 
   sheet.getRange(1, 1, rows.length, rows[0].length).setValues(rows);
 
-  if (rows.length > 1) {
-    alertUi('SimpleFin sync warnings', (rows.length - 1) + ' issue(s) reported by the API. See the "Errors" sheet.');
+  if (errorCount > 0) {
+    alertUi('SimpleFin sync warnings', errorCount + ' issue(s) reported by the API. See the "Errors" sheet.');
   }
 }
 
@@ -685,4 +792,51 @@ function updateBalancesSheet(accountsData) {
     const balanceValues = balanceUpdates.map((u) => u.value);
     sheet.getRange(rowIndex, 2, 1, balanceValues.length).setValues([balanceValues]);
   }
+}
+
+/**
+ * Diagnostic helper: fetches the current data and writes a summary of every account the API
+ * returned (plus any errors and messages) to a "Debug" sheet, and logs the full raw JSON to
+ * the Apps Script execution log. Use this to investigate a missing account (e.g. a mortgage
+ * the bank/connection did not return) - if the account isn't listed here, SimpleFIN did not
+ * return it, and any errlist entry explains why.
+ */
+function debugListAccounts() {
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const accessCodeUrl = scriptProperties.getProperty('accessCodeUrl');
+
+  const endDate = Math.floor(new Date().getTime() / 1000);
+  const responseData = getAccountsAndTransactions(accessCodeUrl, 0, endDate);
+  if (!responseData) {
+    return;
+  }
+  Logger.log('Raw SimpleFin response: ' + JSON.stringify(responseData));
+
+  createSheet(DEBUG_SHEET_NAME);
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(DEBUG_SHEET_NAME);
+  sheet.clearContents();
+
+  const accounts = Array.isArray(responseData.accounts) ? responseData.accounts : [];
+  const lines = [];
+  lines.push(['Accounts returned', accounts.length]);
+  lines.push(['Account ID', 'Name', 'Currency', 'Balance', 'Conn ID', '# Transactions', '# Holdings']);
+  accounts.forEach((account) => {
+    lines.push([account.id, account.name, account.currency, account.balance, account.conn_id || '',
+      (account.transactions || []).length, (account.holdings || []).length]);
+  });
+
+  lines.push(['']);
+  lines.push(['Errors (errlist)']);
+  (responseData.errlist || []).forEach((err) => {
+    lines.push([err.code || '', err.msg || '', err.conn_id || '', err.account_id || '']);
+  });
+  (responseData.errors || []).forEach((msg) => lines.push([String(msg)]));
+
+  lines.push(['']);
+  lines.push(['API messages']);
+  [].concat(responseData['x-api-message'] || []).forEach((msg) => lines.push([String(msg)]));
+
+  lines.forEach((line) => sheet.appendRow(line.length ? line : ['']));
+
+  alertUi('Debug', 'Wrote ' + accounts.length + ' account(s) to the "Debug" sheet. The full raw response is in the Apps Script execution log.');
 }

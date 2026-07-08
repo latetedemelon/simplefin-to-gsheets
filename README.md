@@ -18,7 +18,7 @@ This project allows users to sync financial data from SimpleFIN API into Google 
 - Fetch financial data from the SimpleFIN API (**Protocol v2**) into Google Sheets.
 - Captures all data the API returns, across five sheets:
   - **Accounts** — organization/connection details (name, org ID, org URL, SFIN URL, connection ID/name), balance, available balance, balance date, account open date, and the raw `extra` payload.
-  - **Transactions** — account, transaction ID, posted date, transacted-at date, amount, description, pending flag, category, and the raw `extra` payload (de-duplicated by transaction ID).
+  - **Transactions** — account, transaction ID, posted date, transacted-at date, amount, description, pending flag, **payee**, **memo**, **MCC** (merchant category code), and the raw `extra` payload. De-duplicated by account + transaction ID (SimpleFIN IDs are only unique within an account). Updated incrementally: new transactions are appended and existing rows are updated in place when they change (e.g. a pending transaction that later posts), while the rest of the history is left untouched.
   - **Balances** — a dated time series of each account's balance.
   - **Holdings** — investment/brokerage positions: symbol, shares, cost basis, market value, purchase price, currency, and description.
   - **Errors** — any errors the API reports (e.g. an account that failed to sync), so partial failures are visible instead of silent.
@@ -40,6 +40,7 @@ This project allows users to sync financial data from SimpleFIN API into Google 
    - **Initialize Sheets** — create the Accounts, Transactions, Balances, Holdings, and Errors sheets and claim an access URL. (Existing users upgrading from an earlier version should run this once to create the new **Holdings** and **Errors** tabs.)
    - **Update Accounts and Transactions** — full sync of every sheet.
    - **Update Balances** / **Update Holdings** — refresh just those sheets.
+   - **Debug: List Returned Accounts** — writes a summary of every account SimpleFIN returned (plus any errors and messages) to a "Debug" sheet, and logs the full raw response. Use this if an account (e.g. a mortgage) is missing — if it isn't listed here, SimpleFIN didn't return it, and the Errors sheet explains why.
 2. After the first sync, you can schedule regular updates using Google Apps Script triggers to automate the process. (UI alerts are suppressed under time-based triggers, so scheduled runs won't fail.)
 
 ## Limitations
