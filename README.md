@@ -15,9 +15,15 @@ This project allows users to sync financial data from SimpleFIN API into Google 
 
 ## Features
 
-- Fetch financial data from SimpleFIN API into Google Sheets.
+- Fetch financial data from the SimpleFIN API (**Protocol v2**) into Google Sheets.
+- Captures all data the API returns, across five sheets:
+  - **Accounts** — organization/connection details (name, org ID, org URL, SFIN URL, connection ID/name), balance, available balance, balance date, account open date, and the raw `extra` payload.
+  - **Transactions** — account, transaction ID, posted date, transacted-at date, amount, description, pending flag, category, and the raw `extra` payload (de-duplicated by transaction ID).
+  - **Balances** — a dated time series of each account's balance.
+  - **Holdings** — investment/brokerage positions: symbol, shares, cost basis, market value, purchase price, currency, and description.
+  - **Errors** — any errors the API reports (e.g. an account that failed to sync), so partial failures are visible instead of silent.
+- Pulls all available transaction history by default (configurable via `LOOKBACK_DAYS`) and includes pending transactions (`pending=1`).
 - Automate updates to financial data based on scheduled syncs.
-- Customize the sync behavior through specific parameters.
 - Manage financial data directly in Google Sheets.
 
 ## Setup
@@ -29,16 +35,18 @@ This project allows users to sync financial data from SimpleFIN API into Google 
 
 ## Usage
 
-1. Once the setup is complete, navigate to the Google Sheets document.
-2. Use the menu bar to access the SimpleFIN sync options.
-3. Click `Refresh` to sync data from SimpleFIN API.
-4. After the first sync, you can schedule regular updates using Google Apps Script triggers to automate the process.
+1. Once the setup is complete, navigate to the Google Sheets document and use the **SimpleFin** menu:
+   - **Set SimpleFin Token** — store your SimpleFIN setup token.
+   - **Initialize Sheets** — create the Accounts, Transactions, Balances, Holdings, and Errors sheets and claim an access URL. (Existing users upgrading from an earlier version should run this once to create the new **Holdings** and **Errors** tabs.)
+   - **Update Accounts and Transactions** — full sync of every sheet.
+   - **Update Balances** / **Update Holdings** — refresh just those sheets.
+2. After the first sync, you can schedule regular updates using Google Apps Script triggers to automate the process. (UI alerts are suppressed under time-based triggers, so scheduled runs won't fail.)
 
 ## Limitations
 
 - This script is specific to the SimpleFIN API and Google Sheets. It does not support other APIs or spreadsheet applications.
-- The script may have performance limitations when dealing with large datasets.
-- Some financial data attributes may not be supported depending on the SimpleFIN API version in use.
+- The script may have performance limitations when dealing with large datasets. Pulling full history on the first sync can be slow for accounts with a long transaction history; set `LOOKBACK_DAYS` to a positive number for a rolling window instead.
+- The tool requests API v2 but falls back gracefully if a server still returns the v1 format. Fields such as `Holdings` only appear for institutions/accounts that provide them.
 
 ## Contributing
 
