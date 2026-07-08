@@ -8,6 +8,7 @@ const DEBUG_SHEET_NAME = 'Debug';
 // SimpleFIN API request configuration.
 const SIMPLEFIN_API_VERSION = 2;   // Protocol version to request; set to 1 (or null) for the v1 wire format.
 const INCLUDE_PENDING = true;      // When true, adds pending=1 so pending transactions are returned.
+const FORCE_UPDATE_TRANSACTIONS = false; // When true, rewrite every already-present transaction row each sync (e.g. to backfill new columns), not just changed ones.
 const LOOKBACK_DAYS = 0;           // 0 => page back through all available history; >0 => only the last N days.
 const WINDOW_DAYS = 90;            // SimpleFIN bridge caps a single /accounts request to ~90 days; don't exceed.
 const MAX_HISTORY_DAYS = 730;      // How far back to page when LOOKBACK_DAYS = 0 (safety cap; ~2 years).
@@ -21,6 +22,7 @@ function onOpen() {
     .addItem('Set SimpleFin Token', 'setSimplefinToken')
     .addItem('Initialize Sheets', 'initializeSheets')
     .addItem('Update Accounts and Transactions', 'updateAccountsAndTransactions')
+    .addItem('Force Update Transactions', 'forceUpdateTransactions')
     .addItem('Update Balances', 'updateBalances')
     .addItem('Update Holdings', 'updateHoldings')
     .addItem('Debug: Compare v1 vs v2 Accounts', 'debugCompareVersions')
@@ -467,6 +469,24 @@ function updateAccountsAndTransactions() {
 }
 
 /**
+ * Menu entry point: like Update Accounts and Transactions, but forces every already-present
+ * transaction row to be rewritten (e.g. to backfill newly-added columns onto old rows),
+ * regardless of the FORCE_UPDATE_TRANSACTIONS setting.
+ */
+function forceUpdateTransactions() {
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const accessCodeUrl = scriptProperties.getProperty('accessCodeUrl');
+
+  const history = fetchTransactionHistory(accessCodeUrl);
+  if (!history) {
+    Logger.log('Error: no account data returned');
+    return;
+  }
+  updateTransactionsSheet(history.mergedAccounts, true);
+  surfaceApiErrors(history.firstResponse);
+}
+
+/**
  * Menu entry point: refreshes only the Balances sheet from the latest account balances.
  */
 function updateBalances() {
@@ -627,16 +647,21 @@ function transactionRowSignature(row) {
 
 /**
  * Updates the Transactions sheet incrementally:
- *   - Appends transactions whose ID is not yet present.
- *   - Updates an existing row in place when the transaction changed (e.g. pending -> posted,
- *     amount adjustment), detected via a signature of its mutable fields.
- *   - Leaves unchanged and out-of-window rows untouched, so the full history is preserved.
+ *   - Appends transactions whose (account + transaction ID) is not yet present.
+ *   - Updates an existing row when the transaction changed (e.g. pending -> posted, amount
+ *     adjustment), detected via a signature of its mutable fields. When force is true, EVERY
+ *     already-present transaction in the response is rewritten instead (e.g. to backfill
+ *     newly-added columns onto old rows).
+ *   - Leaves out-of-window rows (not in the response) untouched, so full history is preserved.
  * De-duplicates by account ID + transaction ID (SimpleFIN IDs are unique only within an
  * account). New columns (Transacted At, MCC, Payee, Memo) are appended after the original
  * columns so legacy rows stay aligned.
  * @param {Array} accounts - Array of account objects from the API.
+ * @param {boolean=} forceUpdate - Overrides FORCE_UPDATE_TRANSACTIONS; when true, rewrite every
+ *   matching existing row, not just changed ones.
  */
-function updateTransactionsSheet(accounts) {
+function updateTransactionsSheet(accounts, forceUpdate) {
+  const force = (forceUpdate === undefined) ? FORCE_UPDATE_TRANSACTIONS : forceUpdate;
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(TRANSACTIONS_SHEET_NAME);
 
   const header = ['Account ID', 'Account Name', 'Transaction ID', 'Posted',
@@ -653,28 +678,28 @@ function updateTransactionsSheet(accounts) {
   const numCols = header.length;
   const lastRow = sheet.getLastRow();
 
-  // Index existing rows by (account ID + transaction ID) -> { rowNumber, signature }.
-  const existingByKey = {};
+  // Read existing rows into memory; index by (account ID + transaction ID) -> block index.
+  let block = [];
+  const indexByKey = {};
   if (lastRow > 1) {
-    const existing = sheet.getRange(2, 1, lastRow - 1, numCols).getValues();
-    for (let i = 0; i < existing.length; i++) {
-      const row = existing[i];
-      const id = row[2];
+    block = sheet.getRange(2, 1, lastRow - 1, numCols).getValues();
+    for (let i = 0; i < block.length; i++) {
+      const id = block[i][2];
       if (id !== '' && id != null) {
-        existingByKey[transactionKey(row[0], id)] = { rowNumber: i + 2, sig: transactionRowSignature(row) };
+        indexByKey[transactionKey(block[i][0], id)] = i;
       }
     }
   }
 
   const newTransactions = [];
-  const updates = [];
+  const perRowUpdates = [];
   const seenNewKeys = new Set();
+  let blockDirty = false;
 
   accounts.forEach((account) => {
     (account.transactions || []).forEach((transaction) => {
       const key = transactionKey(account.id, transaction.id);
-      const existing = existingByKey[key];
-      if (!existing) {
+      if (!(key in indexByKey)) {
         // Brand-new transaction: queue for append (guard against dupes within this batch).
         if (!seenNewKeys.has(key)) {
           newTransactions.push(buildTransactionRow(account, transaction));
@@ -682,19 +707,29 @@ function updateTransactionsSheet(accounts) {
         }
         return;
       }
-      // Existing transaction: update the row only if its mutable fields changed.
-      const newSig = transactionApiSignature(transaction);
-      if (newSig !== existing.sig) {
-        updates.push({ rowNumber: existing.rowNumber, values: buildTransactionRow(account, transaction) });
-        existing.sig = newSig; // prevent re-updating the same row within this batch
+      const idx = indexByKey[key];
+      if (force) {
+        // Rewrite the whole matching row (batched into one block write below).
+        block[idx] = buildTransactionRow(account, transaction);
+        blockDirty = true;
+      } else if (transactionApiSignature(transaction) !== transactionRowSignature(block[idx])) {
+        // Update only when the mutable fields changed (e.g. pending -> posted).
+        perRowUpdates.push({ rowNumber: idx + 2, values: buildTransactionRow(account, transaction) });
       }
     });
   });
 
-  // Apply in-place updates to changed rows (e.g. pending -> posted).
-  updates.forEach((update) => {
-    sheet.getRange(update.rowNumber, 1, 1, update.values.length).setValues([update.values]);
-  });
+  if (force) {
+    // Batched: one write covers every matching row (fast even for thousands of rows).
+    if (blockDirty && block.length > 0) {
+      sheet.getRange(2, 1, block.length, numCols).setValues(block);
+    }
+  } else {
+    // Targeted: rewrite only the few changed rows, leaving everything else untouched.
+    perRowUpdates.forEach((update) => {
+      sheet.getRange(update.rowNumber, 1, 1, update.values.length).setValues([update.values]);
+    });
+  }
 
   // Append brand-new transactions in a single batch operation.
   if (newTransactions.length > 0) {
