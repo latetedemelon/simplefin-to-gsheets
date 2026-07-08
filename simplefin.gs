@@ -23,7 +23,7 @@ function onOpen() {
     .addItem('Update Accounts and Transactions', 'updateAccountsAndTransactions')
     .addItem('Update Balances', 'updateBalances')
     .addItem('Update Holdings', 'updateHoldings')
-    .addItem('Debug: List Returned Accounts', 'debugListAccounts')
+    .addItem('Debug: Compare v1 vs v2 Accounts', 'debugCompareVersions')
     .addToUi();
 }
 
@@ -205,8 +205,10 @@ function buildAccountsUrl(baseUrl, opts) {
   if (opts.endDate != null) {
     params.push('end-date=' + opts.endDate);
   }
-  if (SIMPLEFIN_API_VERSION != null) {
-    params.push('version=' + SIMPLEFIN_API_VERSION);
+  // opts.version overrides the configured version (used by the v1-vs-v2 debug comparison).
+  const version = ('version' in opts) ? opts.version : SIMPLEFIN_API_VERSION;
+  if (version != null) {
+    params.push('version=' + version);
   }
   if (INCLUDE_PENDING) {
     params.push('pending=1');
@@ -219,12 +221,17 @@ function buildAccountsUrl(baseUrl, opts) {
  * @param {string} accessCodeUrl - The access code URL with credentials.
  * @param {number|null} startDate - Start date as Unix timestamp, or null to omit.
  * @param {number|null} endDate - End date as Unix timestamp, or null to omit.
+ * @param {number=} version - Optional explicit API version override (else uses SIMPLEFIN_API_VERSION).
  * @returns {Object|null} The response data containing accounts and transactions, or null on error.
  */
-function getAccountsAndTransactions(accessCodeUrl, startDate, endDate) {
+function getAccountsAndTransactions(accessCodeUrl, startDate, endDate, version) {
   const [baseUrl, credentials] = splitUrlAndCredentials(accessCodeUrl);
 
-  const url = buildAccountsUrl(baseUrl, { startDate: startDate, endDate: endDate });
+  const opts = { startDate: startDate, endDate: endDate };
+  if (version !== undefined) {
+    opts.version = version;
+  }
+  const url = buildAccountsUrl(baseUrl, opts);
   const options = {
     method: 'GET',
     headers: {
@@ -885,48 +892,85 @@ function updateBalancesSheet(accountsData) {
 }
 
 /**
- * Diagnostic helper: fetches the current data and writes a summary of every account the API
- * returned (plus any errors and messages) to a "Debug" sheet, and logs the full raw JSON to
- * the Apps Script execution log. Use this to investigate a missing account (e.g. a mortgage
- * the bank/connection did not return) - if the account isn't listed here, SimpleFIN did not
- * return it, and any errlist entry explains why.
+ * Appends error/message rows from a response (v1 errors, v2 errlist, x-api-message) to `lines`.
+ * @param {Array} lines - The output line array to append to.
+ * @param {Object|null} resp - A parsed /accounts response.
  */
-function debugListAccounts() {
-  const scriptProperties = PropertiesService.getScriptProperties();
-  const accessCodeUrl = scriptProperties.getProperty('accessCodeUrl');
-
-  const endDate = Math.floor(new Date().getTime() / 1000);
-  const responseData = getAccountsAndTransactions(accessCodeUrl, 0, endDate);
-  if (!responseData) {
+function pushDebugErrors(lines, resp) {
+  if (!resp) {
+    lines.push(['(no response - fetch failed)']);
     return;
   }
-  Logger.log('Raw SimpleFin response: ' + JSON.stringify(responseData));
+  (resp.errlist || []).forEach((err) => {
+    lines.push([err.code || '', err.msg || '', err.conn_id || '', err.account_id || '']);
+  });
+  (resp.errors || []).forEach((msg) => lines.push([String(msg)]));
+  [].concat(resp['x-api-message'] || []).forEach((msg) => lines.push(['message', String(msg)]));
+  if (!(resp.errlist && resp.errlist.length) && !(resp.errors && resp.errors.length)) {
+    lines.push(['(no errors)']);
+  }
+}
+
+/**
+ * Diagnostic helper: fetches the account list under BOTH API v1 and v2, writes a side-by-side
+ * comparison to a "Debug" sheet (with an "Only in" column flagging accounts returned by one
+ * version but not the other), and logs both raw responses. Use this to check whether a missing
+ * account (e.g. a mortgage) appears under one protocol version but not the other.
+ */
+function debugCompareVersions() {
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const accessCodeUrl = scriptProperties.getProperty('accessCodeUrl');
+  const now = Math.floor(new Date().getTime() / 1000);
+
+  const v1 = getAccountsAndTransactions(accessCodeUrl, 0, now, 1);
+  const v2 = getAccountsAndTransactions(accessCodeUrl, 0, now, 2);
+  Logger.log('Raw v1 response: ' + JSON.stringify(v1));
+  Logger.log('Raw v2 response: ' + JSON.stringify(v2));
 
   createSheet(DEBUG_SHEET_NAME);
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(DEBUG_SHEET_NAME);
   sheet.clearContents();
 
-  const accounts = Array.isArray(responseData.accounts) ? responseData.accounts : [];
+  const v1accts = (v1 && Array.isArray(v1.accounts)) ? v1.accounts : [];
+  const v2accts = (v2 && Array.isArray(v2.accounts)) ? v2.accounts : [];
+
+  // Union of accounts by id, tracking which version(s) each appeared in.
+  const byId = {};
+  const order = [];
+  function note(list, flag) {
+    list.forEach((account) => {
+      if (!byId[account.id]) {
+        byId[account.id] = { id: account.id, name: account.name, currency: account.currency, balance: account.balance };
+        order.push(account.id);
+      }
+      byId[account.id][flag] = true;
+    });
+  }
+  note(v1accts, 'inV1');
+  note(v2accts, 'inV2');
+
   const lines = [];
-  lines.push(['Accounts returned', accounts.length]);
-  lines.push(['Account ID', 'Name', 'Currency', 'Balance', 'Conn ID', '# Transactions', '# Holdings']);
-  accounts.forEach((account) => {
-    lines.push([account.id, account.name, account.currency, account.balance, account.conn_id || '',
-      (account.transactions || []).length, (account.holdings || []).length]);
+  lines.push(['SimpleFIN Debug: v1 vs v2 account comparison']);
+  lines.push(['v1 accounts returned', v1accts.length, 'v2 accounts returned', v2accts.length]);
+  lines.push(['']);
+  lines.push(['Account ID', 'Name', 'Currency', 'Balance', 'In v1', 'In v2', 'Only in']);
+  order.forEach((id) => {
+    const a = byId[id];
+    const onlyIn = (a.inV1 && !a.inV2) ? 'v1' : ((a.inV2 && !a.inV1) ? 'v2' : '');
+    lines.push([a.id, a.name, a.currency, a.balance, a.inV1 ? 'yes' : 'no', a.inV2 ? 'yes' : 'no', onlyIn]);
   });
 
   lines.push(['']);
-  lines.push(['Errors (errlist)']);
-  (responseData.errlist || []).forEach((err) => {
-    lines.push([err.code || '', err.msg || '', err.conn_id || '', err.account_id || '']);
-  });
-  (responseData.errors || []).forEach((msg) => lines.push([String(msg)]));
-
+  lines.push(['v1 errors / messages']);
+  pushDebugErrors(lines, v1);
   lines.push(['']);
-  lines.push(['API messages']);
-  [].concat(responseData['x-api-message'] || []).forEach((msg) => lines.push([String(msg)]));
+  lines.push(['v2 errors / messages']);
+  pushDebugErrors(lines, v2);
 
   lines.forEach((line) => sheet.appendRow(line.length ? line : ['']));
 
-  alertUi('Debug', 'Wrote ' + accounts.length + ' account(s) to the "Debug" sheet. The full raw response is in the Apps Script execution log.');
+  const onlyV1 = order.filter((id) => byId[id].inV1 && !byId[id].inV2).length;
+  const onlyV2 = order.filter((id) => byId[id].inV2 && !byId[id].inV1).length;
+  alertUi('Debug', 'v1 returned ' + v1accts.length + ' account(s), v2 returned ' + v2accts.length +
+    '.\nOnly in v1: ' + onlyV1 + ' | Only in v2: ' + onlyV2 + '.\nSee the "Debug" sheet for the full comparison.');
 }

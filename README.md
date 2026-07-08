@@ -40,7 +40,7 @@ This project allows users to sync financial data from SimpleFIN API into Google 
    - **Initialize Sheets** — create the Accounts, Transactions, Balances, Holdings, and Errors sheets and claim an access URL. (Existing users upgrading from an earlier version should run this once to create the new **Holdings** and **Errors** tabs.)
    - **Update Accounts and Transactions** — full sync of every sheet.
    - **Update Balances** / **Update Holdings** — refresh just those sheets.
-   - **Debug: List Returned Accounts** — writes a summary of every account SimpleFIN returned (plus any errors and messages) to a "Debug" sheet, and logs the full raw response. Use this if an account (e.g. a mortgage) is missing — if it isn't listed here, SimpleFIN didn't return it, and the Errors sheet explains why.
+   - **Debug: Compare v1 vs v2 Accounts** — fetches the account list under both API v1 and v2 and writes a side-by-side comparison (with an "Only in" flag) to a "Debug" sheet, logging both raw responses. Use this if an account (e.g. a mortgage) is missing, to see whether it appears under one protocol version but not the other.
 2. After the first sync, you can schedule regular updates using Google Apps Script triggers to automate the process. (UI alerts are suppressed under time-based triggers, so scheduled runs won't fail.)
 
 ## Limitations
